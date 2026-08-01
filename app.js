@@ -334,10 +334,18 @@ const btnPlay = document.getElementById('btn-play');
 const btnPlayLabel = btnPlay.querySelector('.button-label');
 const btnExport = document.getElementById('btn-export');
 const speedSel = document.getElementById('speed');
+const btnSequential = document.getElementById('btn-sequential');
 
 btnPlay.addEventListener('click', togglePlay);
 btnExport.addEventListener('click', exportCanvas);
 speedSel.addEventListener('change', applySpeed);
+btnSequential.addEventListener('click', () => {
+  const enabled = !btnSequential.classList.contains('on');
+  btnSequential.classList.toggle('on', enabled);
+  btnSequential.setAttribute('aria-pressed', enabled);
+});
+
+function isSequentialMode() { return btnSequential.classList.contains('on'); }
 
 function applySpeed() {
   const r = parseFloat(speedSel.value);
@@ -545,31 +553,65 @@ function applyLayoutGap() {
 
 // ── Playback ──
 
+let sequential = false; // true while playing left-then-right instead of side by side
+
 function togglePlay() {
-  playing ? stopPlay() : startPlay();
+  if (playing) stopPlay();
+  else if (isSequentialMode()) startSequentialPlay();
+  else startPlay();
   recordCanvasChange();
 }
 
+function videoPanels() {
+  return [leftPanel, rightPanel].filter(p => p.loaded);
+}
+
+function setPlayButtonState(isPlaying) {
+  btnPlayLabel.textContent = isPlaying ? 'Pause' : 'Play';
+  btnPlay.classList.toggle('on', isPlaying);
+}
+
 function startPlay() {
-  if (!leftPanel.loaded && !rightPanel.loaded) return;
+  const panels = videoPanels();
+  if (panels.length === 0) return;
   playing = true;
-  btnPlayLabel.textContent = 'Pause';
-  btnPlay.classList.add('on');
+  sequential = false;
+  setPlayButtonState(true);
   applySpeed();
 
-  if (leftPanel.loaded) leftPanel.currentTime = leftPanel.inPoint ?? 0;
-  if (rightPanel.loaded) rightPanel.currentTime = rightPanel.inPoint ?? 0;
+  panels.forEach(p => { p.loopPlayback = true; p.onRangeEnd = null; p.currentTime = p.inPoint ?? 0; });
+  panels.forEach(p => p.startRendering());
+  panels.forEach(p => p.play());
+}
 
-  leftPanel.startRendering(); rightPanel.startRendering();
-  leftPanel.play(); rightPanel.play();
+// Left plays through, freezes on its last frame, then right plays — looping
+// the two-phase sequence until paused. Each panel pauses itself at its own
+// outPoint (loopPlayback=false) instead of looping, and hands off via onRangeEnd.
+function startSequentialPlay() {
+  const panels = videoPanels();
+  if (panels.length === 0) return;
+  playing = true;
+  sequential = true;
+  setPlayButtonState(true);
+  applySpeed();
+
+  panels.forEach(p => { p.loopPlayback = false; p.currentTime = p.inPoint ?? 0; p.startRendering(); });
+  runSequentialPhase(panels, 0);
+}
+
+function runSequentialPhase(panels, index) {
+  if (!playing || !sequential) return; // playback was stopped in the meantime
+  const active = panels[index % panels.length];
+  active.currentTime = active.inPoint ?? 0;
+  active.onRangeEnd = () => runSequentialPhase(panels, index + 1);
+  active.play();
 }
 
 function stopPlay() {
   playing = false;
-  btnPlayLabel.textContent = 'Play';
-  btnPlay.classList.remove('on');
-  leftPanel.pause(); rightPanel.pause();
-  leftPanel.stopRendering(); rightPanel.stopRendering();
+  sequential = false;
+  setPlayButtonState(false);
+  videoPanels().forEach(p => { p.pause(); p.stopRendering(); p.loopPlayback = true; p.onRangeEnd = null; });
 }
 
 // ── Title / Subtitle controls ──
@@ -1009,14 +1051,21 @@ if ('serviceWorker' in navigator) {
 
 // ── Export ──
 
+// One or two videos. In sequential mode, clips play one after another (left, then right)
+// instead of side by side at once — each clip freeze-frames on its first frame before its
+// turn and its last frame after.
 async function exportCanvas() {
   const panels = [];
   if (leftPanel.loaded) panels.push(leftPanel);
   if (rightPanel.loaded) panels.push(rightPanel);
   if (panels.length === 0) return;
   if (playing) stopPlay();
+  await exportVideoOrGif(panels);
+}
 
+async function exportVideoOrGif(panels) {
   const overlay = document.getElementById('export-overlay');
+  const overlayTitle = overlay.querySelector('.export-title');
   const progressFill = overlay.querySelector('.progress-fill');
   const framesCurrent = overlay.querySelector('.export-frames-current');
   const framesTotal = overlay.querySelector('.export-frames-total');
@@ -1024,14 +1073,27 @@ async function exportCanvas() {
   const formatSelect = document.getElementById('export-format');
   const fpsSelect = document.getElementById('export-fps');
 
-  const duration = Math.max(...panels.map(p => (p.outPoint ?? p.duration) - (p.inPoint ?? 0)));
+  const clips = panels;
+  const clipDurations = clips.map(p => (p.outPoint ?? p.duration) - (p.inPoint ?? 0));
 
-  function calcTotalFrames() {
-    const speed = parseFloat(speedSel.value) || 1;
-    const fps = parseInt(fpsSelect.value) || 30;
-    return Math.ceil((duration / speed) * fps);
+  function getSpeed() { return parseFloat(speedSel.value) || 1; }
+  function getFPS() { return parseInt(fpsSelect.value) || 30; }
+
+  function currentDuration() {
+    return isSequentialMode()
+      ? clipDurations.reduce((a, b) => a + b, 0)
+      : Math.max(...clipDurations);
   }
 
+  function calcTotalFrames() {
+    return Math.ceil((currentDuration() / getSpeed()) * getFPS());
+  }
+
+  function updateTitle() {
+    overlayTitle.textContent = isSequentialMode() ? 'Exporting (sequential playback)' : 'Exporting';
+  }
+
+  updateTitle();
   overlay.classList.remove('hidden');
   progressFill.style.width = '0%';
   framesCurrent.textContent = '0';
@@ -1075,9 +1137,16 @@ async function exportCanvas() {
   actionBtn.onclick = dismiss;
   overlay.onclick = (e) => { if (e.target === overlay) dismiss(); };
 
-  const exportSpeed = parseFloat(speedSel.value) || 1;
+  const sequentialExport = isSequentialMode();
+  const clipStarts = [];
+  if (sequentialExport) {
+    let acc = 0;
+    for (const d of clipDurations) { clipStarts.push(acc); acc += d; }
+  }
+
+  const exportSpeed = getSpeed();
   const exportFormat = formatSelect.value;
-  const FPS = parseInt(fpsSelect.value) || 30;
+  const FPS = getFPS();
   fpsSelect.onchange = null;
 
   framesCurrent.textContent = 'Loading exporter…';
@@ -1181,11 +1250,20 @@ async function exportCanvas() {
       framesCurrent.textContent = exportPlugin.frameLabel?.(i + 1, totalFrames) ?? String(i + 1);
       progressFill.style.width = ((i + 1) / totalFrames * 100) + '%';
 
-      // Seek all panels to the correct time
-      await Promise.all(panels.map(p => {
+      // Seek each panel to the correct time.
+      await Promise.all(clips.map((p, idx) => {
         const start = p.inPoint ?? 0;
         const end = p.outPoint ?? p.duration;
-        const target = Math.min(start + t, end);
+        let target;
+        if (sequentialExport) {
+          const segStart = clipStarts[idx];
+          const segEnd = segStart + clipDurations[idx];
+          if (t < segStart) target = start;               // hasn't had its turn yet: first frame
+          else if (t >= segEnd) target = end;              // already had its turn: last frame
+          else target = start + (t - segStart);            // its turn: playing
+        } else {
+          target = Math.min(start + t, end);
+        }
         if (Math.abs(p.video.currentTime - target) < 0.001) return Promise.resolve();
         p.video.currentTime = target;
         return new Promise(r => p.video.addEventListener('seeked', r, { once: true }));
